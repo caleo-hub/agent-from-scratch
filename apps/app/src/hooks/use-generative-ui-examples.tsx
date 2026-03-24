@@ -19,7 +19,11 @@ import {
   BarChartProps,
 } from "@/components/generative-ui/charts/bar-chart";
 import { MeetingTimePicker } from "@/components/generative-ui/meeting-time-picker";
-import { ToolReasoning } from "@/components/tool-rendering";
+import {
+  AgenticRagToolCard,
+  AgenticRagResult,
+  ToolReasoning,
+} from "@/components/tool-rendering";
 
 export const useGenerativeUIExamples = () => {
   const { theme, setTheme } = useTheme();
@@ -72,9 +76,15 @@ export const useGenerativeUIExamples = () => {
     // log_a2ui_event is an internal A2UI event tracker, not meaningful to display to users
     "log_a2ui_event",
   ];
+
   useDefaultRenderTool({
-    render: ({ name, status, parameters }) => {
+    render: (toolCall) => {
+      const { name, status, parameters } = toolCall;
       if (ignoredTools.includes(name)) return <></>;
+      if (name === "agentic_rag") {
+        const result = (toolCall as { result?: AgenticRagResult }).result;
+        return <AgenticRagToolCard status={status} result={result} />;
+      }
       return <ToolReasoning name={name} status={status} args={parameters} />;
     },
   });

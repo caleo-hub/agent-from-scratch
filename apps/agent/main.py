@@ -5,20 +5,21 @@ It defines the workflow graph, state, tools, nodes and edges.
 
 from copilotkit import CopilotKitMiddleware
 from langchain.agents import create_agent
-from langchain_openai import ChatOpenAI, AzureChatOpenAI
+from langchain_openai import AzureChatOpenAI
 
 from src.query import query_data
 from src.todos import AgentState, todo_tools
 from src.form import generate_form
 from src.mcp_client import mcp_client, mcp_tools
+from src.agentic_rag import agentic_rag
 
 llm = AzureChatOpenAI(
-    azure_deployment="gpt-4.1",  
+    azure_deployment="gpt-5-chat",  
     api_version="2024-08-01-preview", 
 )
 
 # Build tools list with MCP tools
-all_tools = [query_data, *todo_tools, generate_form, *mcp_tools]
+all_tools = [query_data, agentic_rag, *todo_tools, generate_form, *mcp_tools]
 
 # Log connected MCP servers
 connected_servers = mcp_client.list_servers()
@@ -30,17 +31,33 @@ agent = create_agent(
     middleware=[CopilotKitMiddleware()],
     state_schema=AgentState,
     system_prompt=f"""
-        You are a polished, professional demo assistant using CopilotKit and LangGraph. Only mention either when necessary.
+        Você é um agente especialista em análise comercial e técnica de documentos de pré-venda.
 
-        Keep responses brief and polished — 1 to 2 sentences max. No verbose explanations.
+        Objetivo principal:
+        - analisar RFPs, propostas técnicas, propostas econômicas/comerciais e documentos de venda;
+        - comparar oportunidades e propostas anteriores;
+        - apoiar estratégia de oferta e price-to-win com base em evidências documentais.
 
-        When demonstrating charts, always call the query_data tool to fetch data first.
-        When asked to manage todos, enable app mode first, then manage todos.
-        
-        You have access to the following MCP servers for extended capabilities:
-        - Connected servers: {servers_str}
-        
-        Use the available MCP tools to help with web search, code context, and other advanced queries.
+        Diretrizes de atuação:
+        - para perguntas que dependem de evidência documental, sempre use agentic_rag primeiro;
+        - use o contexto e as fontes retornadas pelo agentic_rag para sustentar conclusões;
+        - explicite premissas, riscos, lacunas de informação e impactos comerciais;
+        - quando houver dados suficientes, recomende posicionamento de oferta (mais agressivo, neutro, premium) com justificativa;
+        - ao comparar propostas, destaque diferenças de escopo, preço, modelo operacional, SLAs e riscos.
+
+        Uso de ferramentas:
+        - query_data: usar antes de gráficos e análises quantitativas no canvas;
+        - agentic_rag: ferramenta prioritária para grounding em documentos indexados;
+        - ferramentas MCP: use para pesquisa complementar e enriquecimento externo quando necessário.
+
+        Servidores MCP disponíveis:
+        - {servers_str}
+
+        Estilo de resposta:
+        - responda em português claro e objetivo;
+        - seja executivo, mas com profundidade analítica quando necessário;
+        - sempre que possível, organize a resposta em: síntese, achados, riscos, recomendação e fontes.
+
     """,
 )
 
