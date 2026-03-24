@@ -4,6 +4,7 @@ import {
   copilotRuntimeNextJSAppRouterEndpoint,
 } from "@copilotkit/runtime";
 import { LangGraphAgent } from "@copilotkit/runtime/langgraph";
+import { MCPAppsMiddleware } from "@ag-ui/mcp-apps-middleware";
 import { NextRequest } from "next/server";
 
 // 1. Define the agent connection to LangGraph
@@ -13,6 +14,18 @@ const defaultAgent = new LangGraphAgent({
   graphId: "sample_agent",
   langsmithApiKey: process.env.LANGSMITH_API_KEY || "",
 });
+
+defaultAgent.use(
+  new MCPAppsMiddleware({
+    mcpServers: [
+      {
+        type: "http",
+        url: `https://mcp.tavily.com/mcp/?tavilyApiKey=${process.env.TAVILY_API_KEY || ""}`,
+        serverId: "tavily",
+      },
+    ],
+  }),
+);
 
 // 3. Define the route and CopilotRuntime for the agent
 export const POST = async (req: NextRequest) => {
@@ -26,8 +39,10 @@ export const POST = async (req: NextRequest) => {
         servers: [
           {
             type: "http",
-            url: process.env.MCP_SERVER_URL || "https://mcp.excalidraw.com",
-            serverId: "example_mcp_app",
+            url:
+              process.env.MCP_SERVER_URL ||
+              `https://mcp.tavily.com/mcp/?tavilyApiKey=${process.env.TAVILY_API_KEY || ""}`,
+            serverId: "tavily",
           },
         ],
       },
