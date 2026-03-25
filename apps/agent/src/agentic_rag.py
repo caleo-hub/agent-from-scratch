@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-import json
 import os
 import re
 from dataclasses import dataclass
@@ -366,6 +365,67 @@ def _rerank_by_subquery(
     return reranked
 
 
+def _build_chunk_label(payload: dict[str, Any]) -> str:
+    page = _safe_get_text(payload, ["page", "page_number", "pagina"])
+    chunk_value = _safe_get_text(payload, ["chunk_index", "chunkId", "chunk_id", "chunk_number"])
+
+    parts: list[str] = []
+    if page:
+        parts.append(f"pagina {page}")
+    if chunk_value:
+        parts.append(f"chunk {chunk_value}")
+
+    return " · ".join(parts) if parts else "chunk nao identificado"
+
+
+def _fix_azure_blob_url(url: str) -> str:
+    """
+    Fix malformed Azure Blob Storage URLs with SAS tokens.
+    Ensures SAS token comes after the file path: blob.core.windows.net/container/path?sas_token
+    """
+    if not url or "blob.core.windows.net" not in url:
+        return url
+
+    # Check if URL has a SAS token (contains ?sv=)
+    if "?sv=" not in url:
+        return url
+
+    # Split on the first ?sv= to separate base URL from SAS token part
+    parts = url.split("?sv=", 1)
+    if len(parts) != 2:
+        return url
+
+    base_part = parts[0]  # URL before ?sv=
+    sas_part = parts[1]   # SAS token parameters and possibly more path
+
+    # If there's a / in sas_part, it means path comes after SAS token (malformed)
+    if "/" in sas_part:
+        sas_split = sas_part.split("/", 1)
+        if len(sas_split) == 2:
+            sas_params = sas_split[0]  # sv=..&sig=..
+            blob_path = sas_split[1]    # path/to/file.pdf
+            # Reconstruct: container/path/to/file.pdf?sv=...&sig=...
+            return f"{base_part}/{blob_path}?sv={sas_params}"
+
+    return url
+
+
+def _build_document_name(doc: RetrievedDoc) -> str:
+    return _safe_get_text(
+        doc.payload,
+        [
+            "original_document_name",
+            "original_file_name",
+            "file_name",
+            "name_hint",
+            "blob_name",
+            "relative_path",
+            "source",
+        ],
+        fallback=doc.source,
+    )
+
+
 def _merge_docs(
     question: str,
     reranked_by_query: dict[str, list[RetrievedDoc]],
@@ -423,23 +483,39 @@ def _merge_docs(
         context_lines.append(f"[{idx}] Conteúdo: {snippet}")
         context_lines.append("")
 
+        document_name = _build_document_name(doc)
+        chunk_label = _build_chunk_label(doc.payload)
+
         source_url = _safe_get_text(
             doc.payload,
             ["source_url", "url", "uri", "blob_url", "file_url"],
         )
         if not source_url and doc.source.startswith("http"):
             source_url = doc.source
+        
+        # Fix malformed Azure Blob URLs with SAS tokens
+        source_url = _fix_azure_blob_url(source_url)
 
         sources.append(
             {
                 "rank": idx,
                 "source": doc.source,
+                "document_name": document_name,
                 "source_url": source_url,
                 "id": doc.id,
                 "score": round(doc.score, 4),
                 "rerank_score": round(doc.rerank_score, 4),
                 "subquery": doc.subquery,
                 "snippet": snippet,
+                "chunk": {
+                    "label": chunk_label,
+                    "page": _safe_get_text(doc.payload, ["page", "page_number", "pagina"]),
+                    "index": _safe_get_text(
+                        doc.payload,
+                        ["chunk_index", "chunkId", "chunk_id", "chunk_number"],
+                    ),
+                },
+                "tooltip": f"Documento: {document_name} | Trecho: {chunk_label}",
                 "metadata": {
                     key: value
                     for key, value in doc.payload.items()
@@ -550,7 +626,34 @@ def agentic_rag(
         flat_docs = [doc for docs in retrieved_by_query.values() for doc in docs]
         reranked_flat = [doc for docs in reranked_by_query.values() for doc in docs]
 
+        artifacts = [
+            {
+                "type": "document_sources",
+                "title": "Fontes utilizadas",
+                "collapsible": True,
+                "show_only_when_complete": True,
+                "items": [
+                    {
+                        "rank": source.get("rank"),
+                        "document_name": source.get("document_name") or source.get("source"),
+                        "source_label": source.get("source"),
+                        "source_url": source.get("source_url"),
+                        "chunk": source.get("chunk"),
+                        "tooltip": source.get("tooltip"),
+                        "doc_type": str(
+                            (source.get("metadata") or {}).get("document_type") or ""
+                        ).strip(),
+                        "snippet": source.get("snippet"),
+                        "score": source.get("score"),
+                        "rerank_score": source.get("rerank_score"),
+                    }
+                    for source in sources
+                ],
+            }
+        ]
+
         return {
+            "schema_version": "1.0",
             "query": query,
             "substeps": [
                 "plan_queries",
@@ -559,23 +662,31 @@ def agentic_rag(
                 "rerank",
                 "merge_docs",
             ],
-            "plan": plan,
-            "queries_planned": [plan.get("corrected_question", ""), *plan.get("components", [])],
-            "queries_built": built_queries,
-            "retrieve_counts": {k: len(v) for k, v in retrieved_by_query.items()},
-            "retrieve_mode_by_query": retrieve_mode_by_query,
-            "total_retrieved": len(flat_docs),
-            "total_after_rerank": len(reranked_flat),
-            "dedupe_stats": dedupe_stats,
-            "rerank_strategy": (
-                "cross_encoder" if _get_cross_encoder_model() is not None else "lexical_fallback"
-            ),
-            "cross_encoder_default_model": DEFAULT_CROSS_ENCODER_MODEL,
-            "cross_encoder_enabled": _bool_env("RAG_ENABLE_CROSS_ENCODER", False),
-            "hybrid_fallback_enabled": enable_hybrid_fallback,
-            "source_filter": source_filter,
             "context": context,
             "sources": sources,
+            "artifacts": artifacts,
+            "ui": {
+                "accordion_title": "Fontes utilizadas na resposta",
+                "empty_state": "Nenhuma fonte estruturada foi retornada.",
+                "show_sources_only_when_complete": True,
+            },
+            "trace": {
+                "plan": plan,
+                "queries_planned": [plan.get("corrected_question", ""), *plan.get("components", [])],
+                "queries_built": built_queries,
+                "retrieve_counts": {k: len(v) for k, v in retrieved_by_query.items()},
+                "retrieve_mode_by_query": retrieve_mode_by_query,
+                "total_retrieved": len(flat_docs),
+                "total_after_rerank": len(reranked_flat),
+                "dedupe_stats": dedupe_stats,
+                "rerank_strategy": (
+                    "cross_encoder" if _get_cross_encoder_model() is not None else "lexical_fallback"
+                ),
+                "cross_encoder_default_model": DEFAULT_CROSS_ENCODER_MODEL,
+                "cross_encoder_enabled": _bool_env("RAG_ENABLE_CROSS_ENCODER", False),
+                "hybrid_fallback_enabled": enable_hybrid_fallback,
+                "source_filter": source_filter,
+            },
             "document_guide": DOCUMENT_GUIDE,
             "usage_instructions": (
                 "Responda usando prioritariamente o campo context e cite as fontes pelo campo sources."
@@ -583,4 +694,4 @@ def agentic_rag(
         }
 
     result = asyncio.run(_run())
-    return json.dumps(result, ensure_ascii=True)
+    return result

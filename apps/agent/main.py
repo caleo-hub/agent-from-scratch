@@ -3,6 +3,16 @@ This is the main entry point for the agent.
 It defines the workflow graph, state, tools, nodes and edges.
 """
 
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env from root of project
+root_dir = Path(__file__).parent.parent.parent
+env_file = root_dir / ".env"
+if env_file.exists():
+    load_dotenv(env_file)
+
 from copilotkit import CopilotKitMiddleware
 from langchain.agents import create_agent
 from langchain_openai import AzureChatOpenAI

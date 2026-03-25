@@ -82,6 +82,7 @@ export const useGenerativeUIExamples = () => {
       const { name, status, parameters } = toolCall;
       if (ignoredTools.includes(name)) return <></>;
       if (name === "agentic_rag") {
+        if (status !== "complete") return <></>;
         const result = (toolCall as { result?: AgenticRagResult }).result;
         return <AgenticRagToolCard status={status} result={result} />;
       }

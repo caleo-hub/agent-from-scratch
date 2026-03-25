@@ -9,23 +9,59 @@ interface ToolReasoningProps {
 }
 
 export interface AgenticRagResult {
+  schema_version?: string;
   query?: string;
   context?: string;
   substeps?: string[];
-  queries_planned?: string[];
-  queries_built?: string[];
-  total_retrieved?: number;
   sources?: Array<{
     rank?: number;
     source?: string;
+    document_name?: string;
     source_url?: string;
     id?: string;
     score?: number;
     rerank_score?: number;
     subquery?: string;
     snippet?: string;
+    tooltip?: string;
+    chunk?: {
+      label?: string;
+      page?: string;
+      index?: string;
+    };
     metadata?: Record<string, unknown>;
   }>;
+  artifacts?: Array<{
+    type?: string;
+    title?: string;
+    collapsible?: boolean;
+    show_only_when_complete?: boolean;
+    items?: Array<{
+      rank?: number;
+      document_name?: string;
+      source_label?: string;
+      source_url?: string;
+      doc_type?: string;
+      tooltip?: string;
+      snippet?: string;
+      score?: number;
+      rerank_score?: number;
+      chunk?: {
+        label?: string;
+        page?: string;
+        index?: string;
+      };
+    }>;
+  }>;
+  ui?: {
+    accordion_title?: string;
+    empty_state?: string;
+    show_sources_only_when_complete?: boolean;
+  };
+  trace?: {
+    total_retrieved?: number;
+    total_after_rerank?: number;
+  };
 }
 
 const statusIndicator = {
@@ -99,6 +135,22 @@ function titleize(step: string) {
   return step.replaceAll("_", " ");
 }
 
+const DOC_TYPE_ICON: Record<string, string> = {
+  rfp: "📋",
+  proposta_tecnica: "🔧",
+  proposta_comercial: "💰",
+  deal_review: "📊",
+  anexos: "📎",
+};
+
+function normalizeDocType(docType?: string) {
+  return (docType || "").trim().toLowerCase().replaceAll(" ", "_");
+}
+
+function getDocTypeIcon(docType?: string) {
+  return DOC_TYPE_ICON[normalizeDocType(docType)] || "📄";
+}
+
 export function AgenticRagToolCard({
   status,
   result,
@@ -107,7 +159,29 @@ export function AgenticRagToolCard({
   result?: AgenticRagResult;
 }) {
   const isComplete = status === "complete";
-  const sources = result?.sources || [];
+  
+  // Parse result if it's a string (JSON) — LangGraph can return serialized objects
+  let parsedResult = result;
+  if (typeof result === 'string') {
+    try {
+      parsedResult = JSON.parse(result);
+    } catch (e) {
+      console.error('[AgenticRagToolCard] Failed to parse result as JSON:', e);
+    }
+  }
+  
+  const documentSources = parsedResult?.artifacts?.find(
+    (artifact) => artifact.type === "document_sources",
+  );
+  const sources = documentSources?.items || [];
+  const accordionTitle =
+    parsedResult?.ui?.accordion_title || documentSources?.title || "Fontes utilizadas";
+  const emptyState =
+    parsedResult?.ui?.empty_state || "Nenhuma fonte estruturada foi retornada.";
+  const showOnlyWhenComplete = parsedResult?.ui?.show_sources_only_when_complete !== false;
+  const shouldShowSources = isComplete || !showOnlyWhenComplete;
+  const totalRetrieved = (parsedResult as any)?.trace?.total_retrieved;
+  const totalAfterRerank = (parsedResult as any)?.trace?.total_after_rerank;
 
   return (
     <section
@@ -148,61 +222,88 @@ export function AgenticRagToolCard({
         </p>
       ) : null}
 
-      {typeof result?.total_retrieved === "number" ? (
+      {typeof totalRetrieved === "number" ? (
         <p className="mb-2 text-xs text-zinc-700 dark:text-zinc-200">
-          <strong>Documentos recuperados:</strong> {result.total_retrieved}
+          <strong>Documentos recuperados:</strong> {totalRetrieved}
+          {typeof totalAfterRerank === "number"
+            ? ` | apos rerank: ${totalAfterRerank}`
+            : ""}
         </p>
       ) : null}
 
-      {sources.length > 0 ? (
+      {!isComplete ? (
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          As fontes estruturadas serao exibidas ao final da resposta.
+        </p>
+      ) : null}
+
+      {shouldShowSources ? (
         <div>
-          <h4 className="mb-1 text-xs font-semibold text-zinc-800 dark:text-zinc-100">
-            Sources
-          </h4>
-          <ul className="space-y-2" aria-label="Fontes utilizadas">
-            {sources.map((source, idx) => (
-              <li
-                key={`${source.id || source.source || "source"}-${idx}`}
-                className="rounded-md border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-950"
-              >
-                <details>
-                  <summary className="cursor-pointer list-none text-xs font-medium text-zinc-800 dark:text-zinc-100">
-                    {source.rank || idx + 1}. {source.source || "Fonte sem nome"}
-                  </summary>
-                  <div className="mt-2 space-y-1">
-                    {source.source_url ? (
-                      <a
-                        href={source.source_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-block text-xs text-blue-600 underline dark:text-blue-400"
-                      >
-                        Abrir fonte
-                      </a>
-                    ) : null}
-                    {typeof source.score === "number" ? (
-                      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                        score: {source.score.toFixed(4)}
-                        {typeof source.rerank_score === "number"
-                          ? ` | rerank: ${source.rerank_score.toFixed(4)}`
-                          : ""}
-                      </p>
-                    ) : null}
-                    {source.subquery ? (
-                      <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
-                        subquery: {source.subquery}
-                      </p>
-                    ) : null}
-                    {source.snippet ? (
-                      <p className="text-xs text-zinc-700 dark:text-zinc-300">
-                        {source.snippet}
-                      </p>
-                    ) : null}
-                  </div>
-                </details>
-              </li>
-            ))}
-          </ul>
+          <details className="rounded-md border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-950">
+            <summary className="cursor-pointer list-none px-3 py-2 text-xs font-semibold text-zinc-800 dark:text-zinc-100">
+              {accordionTitle}
+            </summary>
+
+            {sources.length > 0 ? (
+              <ul className="space-y-2 px-3 pb-3" aria-label={accordionTitle}>
+                {sources.map((source, idx) => {
+                  const chunkLabel = source.chunk?.label || "chunk nao identificado";
+                  const documentName = source.document_name || source.source_label || "Fonte sem nome";
+                  const tooltip =
+                    source.tooltip || `Documento: ${documentName} | Trecho: ${chunkLabel}`;
+
+                  return (
+                    <li
+                      key={`${documentName}-${idx}`}
+                      className="rounded-md border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-700 dark:bg-zinc-900"
+                      title={tooltip}
+                    >
+                      <div className="flex items-start gap-2">
+                        <span className="text-sm leading-none" aria-hidden>
+                          {getDocTypeIcon(source.doc_type)}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2">
+                            <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                              {source.rank || idx + 1}.
+                            </span>
+                            {source.source_url ? (
+                              <a
+                                href={source.source_url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="truncate text-xs font-medium text-blue-600 underline underline-offset-2 dark:text-blue-400"
+                                title={tooltip}
+                              >
+                                {documentName}
+                              </a>
+                            ) : (
+                              <span className="truncate text-xs font-medium text-zinc-800 dark:text-zinc-100">
+                                {documentName}
+                              </span>
+                            )}
+                          </div>
+                          <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                            {chunkLabel}
+                            {source.source_label ? ` | fonte: ${source.source_label}` : ""}
+                          </p>
+                          {source.snippet ? (
+                            <p className="mt-1 line-clamp-2 text-[11px] text-zinc-600 dark:text-zinc-300">
+                              {source.snippet}
+                            </p>
+                          ) : null}
+                        </div>
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <p className="px-3 pb-3 text-xs text-zinc-500 dark:text-zinc-400">
+                {emptyState}
+              </p>
+            )}
+          </details>
         </div>
       ) : null}
     </section>
