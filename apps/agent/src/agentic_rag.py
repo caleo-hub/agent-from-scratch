@@ -10,7 +10,10 @@ import httpx
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.aio import SearchClient
 from azure.search.documents.models import VectorizedQuery
+from langchain_core.prompts import ChatPromptTemplate
 from langchain.tools import tool
+from langchain_openai import AzureChatOpenAI
+from pydantic import BaseModel, Field
 
 
 DEFAULT_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
@@ -119,7 +122,108 @@ def _infer_doc_types(question: str, history: str) -> list[str]:
     return deduped
 
 
-def _plan_queries(question: str, history: str = "") -> dict[str, Any]:
+class QueryPlanOutput(BaseModel):
+    corrected_question: str = Field(
+        description="Normalized, corrected question preserving the user's intent."
+    )
+    components: list[str] = Field(
+        default_factory=list,
+        description="Key semantic components to investigate in retrieval.",
+    )
+    inferred_doc_types: list[str] = Field(
+        default_factory=list,
+        description="Relevant document types among: rfp, proposta_tecnica, proposta_comercial, anexos, deal_review",
+    )
+    should_generate_paraphrases: bool = Field(
+        default=True,
+        description="Whether query expansion/paraphrases should be used.",
+    )
+
+
+class QueryBuildOutput(BaseModel):
+    queries: list[str] = Field(
+        default_factory=list,
+        description="Final retrieval subqueries, deduplicated, ordered by expected utility.",
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_query_planner_llm() -> AzureChatOpenAI | None:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+    deployment = os.getenv("AZURE_OPENAI_RAG_PLANNER_DEPLOYMENT", "gpt-4.1")
+
+    if not endpoint or not api_key or not deployment:
+        return None
+
+    return AzureChatOpenAI(
+        azure_endpoint=endpoint,
+        api_key=api_key,
+        api_version=api_version,
+        azure_deployment=deployment,
+        temperature=0,
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_plan_query_chain():
+    llm = _get_query_planner_llm()
+    if llm is None:
+        return None
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a retrieval planning expert for enterprise RAG. "
+                "Decompose the user question into high-signal retrieval components. "
+                "Infer likely document types and decide whether paraphrases are needed. "
+                "Be concise, objective, and domain-aware.",
+            ),
+            (
+                "human",
+                "Question: {question}\n"
+                "Conversation history: {history}\n"
+                "Document taxonomy guide: {document_guide}\n"
+                "Return structured output only.",
+            ),
+        ]
+    )
+
+    return prompt | llm.with_structured_output(QueryPlanOutput)
+
+
+@lru_cache(maxsize=1)
+def _get_build_query_chain():
+    llm = _get_query_planner_llm()
+    if llm is None:
+        return None
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a query rewriting expert for vector/hybrid retrieval. "
+                "Generate precise, diverse subqueries from a retrieval plan. "
+                "Avoid overly generic queries. Keep wording close to business and technical language in enterprise documents.",
+            ),
+            (
+                "human",
+                "Corrected question: {corrected_question}\n"
+                "Components: {components}\n"
+                "Inferred document types: {inferred_doc_types}\n"
+                "Should generate paraphrases: {should_generate_paraphrases}\n"
+                "Fanout (max number of queries): {fanout}\n"
+                "Return only the best subqueries in priority order and structured output.",
+            ),
+        ]
+    )
+
+    return prompt | llm.with_structured_output(QueryBuildOutput)
+
+
+def _plan_queries_heuristic(question: str, history: str = "") -> dict[str, Any]:
     corrected_question = _normalize_text(question).strip(" ?")
     components = _split_components(corrected_question)
     inferred_doc_types = _infer_doc_types(corrected_question, history)
@@ -132,10 +236,11 @@ def _plan_queries(question: str, history: str = "") -> dict[str, Any]:
         "inferred_doc_types": inferred_doc_types,
         "history_used": _normalize_text(history)[:1200],
         "document_guide": DOCUMENT_GUIDE,
+        "plan_strategy": "heuristic",
     }
 
 
-def _build_queries(plan: dict[str, Any], fanout: int) -> list[str]:
+def _build_queries_heuristic(plan: dict[str, Any], fanout: int) -> list[str]:
     corrected_question = str(plan.get("corrected_question", ""))
     components = [str(c) for c in plan.get("components", [])]
     inferred_doc_types = [str(d) for d in plan.get("inferred_doc_types", [])]
@@ -168,6 +273,102 @@ def _build_queries(plan: dict[str, Any], fanout: int) -> list[str]:
             break
 
     return queries
+
+
+def _plan_queries(question: str, history: str = "") -> dict[str, Any]:
+    fallback = _plan_queries_heuristic(question, history)
+    chain = _get_plan_query_chain()
+
+    if chain is None:
+        return fallback
+
+    try:
+        response = chain.invoke(
+            {
+                "question": _normalize_text(question),
+                "history": _normalize_text(history)[:4000],
+                "document_guide": DOCUMENT_GUIDE,
+            }
+        )
+
+        corrected_question = _normalize_text(response.corrected_question).strip(" ?")
+        if not corrected_question:
+            corrected_question = fallback["corrected_question"]
+
+        components = [
+            _normalize_text(component)
+            for component in response.components
+            if _normalize_text(component)
+        ]
+        if not components:
+            components = fallback["components"]
+
+        inferred_doc_types = [
+            _normalize_text(doc_type).lower().replace(" ", "_")
+            for doc_type in response.inferred_doc_types
+            if _normalize_text(doc_type)
+        ]
+
+        allowed_doc_types = {
+            "rfp",
+            "proposta_tecnica",
+            "proposta_comercial",
+            "anexos",
+            "deal_review",
+        }
+        inferred_doc_types = [d for d in inferred_doc_types if d in allowed_doc_types]
+
+        return {
+            "corrected_question": corrected_question,
+            "components": components[: max(2, min(6, len(components)))],
+            "should_generate_paraphrases": bool(response.should_generate_paraphrases),
+            "inferred_doc_types": inferred_doc_types,
+            "history_used": _normalize_text(history)[:1200],
+            "document_guide": DOCUMENT_GUIDE,
+            "plan_strategy": "llm_chain",
+        }
+    except Exception as exc:
+        fallback["plan_error"] = str(exc)
+        return fallback
+
+
+def _build_queries(plan: dict[str, Any], fanout: int) -> list[str]:
+    fallback = _build_queries_heuristic(plan, fanout)
+    chain = _get_build_query_chain()
+
+    if chain is None:
+        return fallback
+    try:
+        response = chain.invoke(
+            {
+                "corrected_question": str(plan.get("corrected_question", "")).strip(),
+                "components": [str(c) for c in plan.get("components", [])],
+                "inferred_doc_types": [str(d) for d in plan.get("inferred_doc_types", [])],
+                "should_generate_paraphrases": bool(plan.get("should_generate_paraphrases", False)),
+                "fanout": fanout,
+            }
+        )
+
+        queries: list[str] = []
+        seen: set[str] = set()
+
+        for candidate in response.queries:
+            normalized = _normalize_text(candidate)
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            queries.append(normalized)
+            if len(queries) >= fanout:
+                break
+
+        if not queries:
+            return fallback
+        return queries
+    except Exception:
+        return fallback
 
 
 async def _embed_query(text: str) -> list[float] | None:
@@ -571,7 +772,9 @@ def agentic_rag(
     top_k = max(1, min(top_k, 20))
     source_filter = _normalize_text(source_filter)
 
-    plan = _plan_queries(query, history)
+    effective_history = _normalize_text(history)
+
+    plan = _plan_queries(query, effective_history)
     built_queries = _build_queries(plan, fanout)
 
     enable_hybrid_fallback = _bool_env("RAG_ENABLE_HYBRID_FALLBACK", False)
@@ -686,6 +889,7 @@ def agentic_rag(
                 "cross_encoder_enabled": _bool_env("RAG_ENABLE_CROSS_ENCODER", False),
                 "hybrid_fallback_enabled": enable_hybrid_fallback,
                 "source_filter": source_filter,
+                "history_chars": len(effective_history),
             },
             "document_guide": DOCUMENT_GUIDE,
             "usage_instructions": (

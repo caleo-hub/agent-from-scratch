@@ -61,6 +61,11 @@ export interface AgenticRagResult {
   trace?: {
     total_retrieved?: number;
     total_after_rerank?: number;
+    queries_planned?: string[];
+    queries_built?: string[];
+    retrieve_counts?: Record<string, number>;
+    retrieve_mode_by_query?: Record<string, string>;
+    rerank_strategy?: string;
   };
 }
 
@@ -182,6 +187,11 @@ export function AgenticRagToolCard({
   const shouldShowSources = isComplete || !showOnlyWhenComplete;
   const totalRetrieved = (parsedResult as any)?.trace?.total_retrieved;
   const totalAfterRerank = (parsedResult as any)?.trace?.total_after_rerank;
+  const queriesPlanned = parsedResult?.trace?.queries_planned || [];
+  const queriesBuilt = parsedResult?.trace?.queries_built || [];
+  const retrieveCounts = parsedResult?.trace?.retrieve_counts || {};
+  const retrieveModes = parsedResult?.trace?.retrieve_mode_by_query || {};
+  const rerankStrategy = parsedResult?.trace?.rerank_strategy;
 
   return (
     <section
@@ -229,6 +239,38 @@ export function AgenticRagToolCard({
             ? ` | apos rerank: ${totalAfterRerank}`
             : ""}
         </p>
+      ) : null}
+
+      {queriesBuilt.length > 0 ? (
+        <details className="mb-3 rounded-md border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-950">
+          <summary className="cursor-pointer list-none px-3 py-2 text-xs font-semibold text-zinc-800 dark:text-zinc-100">
+            Subqueries usadas na busca ({queriesBuilt.length})
+          </summary>
+          <div className="space-y-2 px-3 pb-3">
+            {queriesBuilt.map((query, idx) => {
+              const count = retrieveCounts?.[query] ?? 0;
+              const mode = retrieveModes?.[query] || "vector_only";
+              return (
+                <div
+                  key={`${query}-${idx}`}
+                  className="rounded border border-zinc-200 bg-zinc-50 px-2 py-1.5 dark:border-zinc-700 dark:bg-zinc-900"
+                >
+                  <p className="text-[11px] font-medium text-zinc-800 dark:text-zinc-100">
+                    {idx + 1}. {query}
+                  </p>
+                  <p className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">
+                    resultados: {count} | modo: {mode}
+                  </p>
+                </div>
+              );
+            })}
+            {queriesPlanned.length > 0 ? (
+              <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
+                planejadas: {queriesPlanned.length} | rerank: {rerankStrategy || "n/a"}
+              </p>
+            ) : null}
+          </div>
+        </details>
       ) : null}
 
       {!isComplete ? (
