@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAgent } from "@copilotkit/react-core/v2";
 import { extractTextFromPdf } from "@/lib/pdf-extract";
 
@@ -60,6 +60,7 @@ export function useFileAttachment() {
   const { agent } = useAgent();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
+  const [queuedMessage, setQueuedMessage] = useState<string | null>(null);
 
   const syncDocumentToState = useCallback(
     (file: PendingFile) => {
@@ -287,10 +288,8 @@ export function useFileAttachment() {
     [parseWithDocling, syncDocumentToState]
   );
 
-  // Submit user message while uploaded docs are already available in state.
-  const submitWithFiles = useCallback(
-    (message: string) => {
-      const syncedFiles = pendingFiles.filter((f) => f.status === "ready" && f.syncedToState);
+  const finalizeSubmit = useCallback(
+    (message: string, syncedFiles: PendingFile[]) => {
 
       console.log("[FileAttachment] 📊 submitWithFiles called:", {
         messageText: message,
@@ -298,7 +297,7 @@ export function useFileAttachment() {
         syncedFileNames: syncedFiles.map((f) => f.name),
       });
 
-      // If no message and no files, don't send
+      // If no message and no files, don't send.
       if (!message?.trim() && syncedFiles.length === 0) {
         console.warn("[FileAttachment] ⚠️ Empty message and no files, skipping send");
         return;
@@ -343,6 +342,18 @@ export function useFileAttachment() {
           pendingCount: fromPending.length,
           mergedCount: merged.length,
         });
+
+        const attachmentSummary =
+          syncedFiles.length === 1
+            ? `📎 Arquivo anexado: ${syncedFiles[0].name}`
+            : `📎 Arquivos anexados:\n${syncedFiles.map((f) => `- ${f.name}`).join("\n")}`;
+
+        // Add a visible user message so the attachment appears in chat history.
+        agent.addMessage({
+          role: "user",
+          id: crypto.randomUUID(),
+          content: attachmentSummary,
+        });
       }
 
       console.log("[FileAttachment] 📤 Sending user message to agent:", {
@@ -361,8 +372,36 @@ export function useFileAttachment() {
       agent.runAgent();
       setPendingFiles([]);
     },
-    [agent, pendingFiles]
+    [agent]
   );
+
+  // Submit user message while uploaded docs are already available in state.
+  const submitWithFiles = useCallback(
+    (message: string) => {
+      const hasProcessingFiles = pendingFiles.some((f) => f.status === "processing");
+
+      if (hasProcessingFiles) {
+        setQueuedMessage(message ?? "");
+        console.log("[FileAttachment] ⏳ Queued message until file processing completes");
+        return;
+      }
+
+      const syncedFiles = pendingFiles.filter((f) => f.status === "ready" && f.syncedToState);
+      finalizeSubmit(message, syncedFiles);
+    },
+    [finalizeSubmit, pendingFiles]
+  );
+
+  useEffect(() => {
+    if (queuedMessage === null) return;
+
+    const hasProcessingFiles = pendingFiles.some((f) => f.status === "processing");
+    if (hasProcessingFiles) return;
+
+    const syncedFiles = pendingFiles.filter((f) => f.status === "ready" && f.syncedToState);
+    finalizeSubmit(queuedMessage, syncedFiles);
+    setQueuedMessage(null);
+  }, [finalizeSubmit, pendingFiles, queuedMessage]);
 
   // Render pending files as chips in the input area
   const PendingFilesSlot = useMemo(
@@ -403,12 +442,15 @@ export function useFileAttachment() {
               {!hasProcessingFiles && (
                 <span className="text-xs text-zinc-500">Arquivos anexados à conversa. Digite sua mensagem e envie.</span>
               )}
+              {queuedMessage !== null && hasProcessingFiles && (
+                <span className="text-xs text-blue-600">Mensagem será enviada automaticamente quando os anexos terminarem.</span>
+              )}
             </div>
             {children}
           </div>
         );
       },
-    [pendingFiles]
+    [pendingFiles, queuedMessage]
   );
 
   return {
